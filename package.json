@@ -1,0 +1,16 @@
+{
+  "name": "fence-gallery-api",
+  "version": "1.0.0",
+  "description": "Netlify Functions backend — validates GHL contact IDs for fence gallery access",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "netlify dev",
+    "test": "node tests/validate-code.test.js"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.0.0"
+  }
+}

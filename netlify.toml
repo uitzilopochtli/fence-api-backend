@@ -1,0 +1,35 @@
+# netlify.toml
+# Netlify site configuration for the fence gallery access-code API.
+
+[build]
+  # Where Netlify looks for your serverless functions.
+  functions = "netlify/functions"
+
+  # No static site to publish — this repo is API-only.
+  # Remove or change this if you add a frontend here later.
+  publish = "public"
+
+# ----- Function-level settings ---------------------------------------------
+
+[functions]
+  # Use Node.js 20 (LTS). Netlify supports 18 and 20.
+  node_bundler = "esbuild"
+
+# ----- Redirect: make the function URL nicer --------------------------------
+# Callers can POST to  /api/validate-code
+# instead of  /.netlify/functions/validate-code
+
+[[redirects]]
+  from   = "/api/validate-code"
+  to     = "/.netlify/functions/validate-code"
+  status = 200
+
+# ----- Security headers (applied to all responses) -------------------------
+
+[[headers]]
+  for = "/*"
+
+  [headers.values]
+    X-Frame-Options        = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy        = "no-referrer"
