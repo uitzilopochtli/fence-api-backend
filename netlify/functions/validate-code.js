@@ -1,13 +1,21 @@
 // netlify/functions/validate-code.js
-// Validates access codes against a static weekly code list.
+// Validates access codes against an auto-rotating weekly code.
 // No external API calls — validation is purely local.
 //
-// To update the weekly code: change CURRENT_WEEK_CODE below and redeploy.
+// The weekly code is WEEK{N} where N is the current ISO week number (1–53).
+// It rotates automatically every Monday — no manual updates needed.
 
 // ----- Code list -----------------------------------------------------------
 
-// Update this each week (e.g. WEEK1, WEEK2, … WEEK52)
-const CURRENT_WEEK_CODE = "WEEK8";
+// Returns the ISO week number for today (1–53).
+// Weeks start on Monday. Resets at the start of each year.
+function getCurrentWeekNumber() {
+  const now = new Date();
+  const d = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7)); // Thursday of current week
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+}
 
 // Master codes — always valid
 const MASTER_CODES = new Set(["ADMIN2024", "DESPLAINES", "MASTER"]);
@@ -29,7 +37,8 @@ function validateAccessCode(code) {
 
   const normalized = code.trim().toUpperCase();
 
-  if (normalized === CURRENT_WEEK_CODE || MASTER_CODES.has(normalized)) {
+  const weekCode = `WEEK${getCurrentWeekNumber()}`;
+  if (normalized === weekCode || MASTER_CODES.has(normalized)) {
     return { valid: true };
   }
 
