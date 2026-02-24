@@ -1,10 +1,13 @@
 // netlify/functions/validate-code.js
-// Validates a GHL contact ID by reading the appointment date/time stored
-// directly on the contact record (written by Zapier from Google Calendar):
-//   contact.city  → appointment date  e.g. "Feb 21, 2026"
-//   contact.state → appointment time  e.g. "11:00AM"
+// Validates a 4-char access code (last 4 chars of a GHL contact ID)
+// by searching today's appointments for the location.
 //
-// Access window: 2 hours BEFORE → 4 hours AFTER appointment start time.
+// Flow:
+//   1. Receive 4-char code (e.g. "3bIr")
+//   2. Fetch today's appointments from GHL Appointments API (filtered by locationId)
+//   3. Find appointment(s) whose contactId ends with the code
+//   4. Exactly 1 match → check time window; 0 or 2+ → error
+//   5. Access window: 2 hours BEFORE → 4 hours AFTER appointment start time.
 
 const GHL_API_BASE = "https://rest.gohighlevel.com";
 
@@ -32,110 +35,124 @@ function authHeaders() {
 }
 
 /**
- * Fetch a GHL contact by ID.
- * Returns the contact object, or null if not found.
+ * Parse APPOINTMENT_TZ offset string (e.g. "-05:00") into milliseconds.
+ * Returns 0 for UTC if missing or invalid.
  */
-async function fetchContact(contactId) {
-  const url = `${GHL_API_BASE}/v1/contacts/${contactId}`;
-  const response = await fetch(url, { headers: authHeaders() });
+function parseTzOffsetMs(tzStr) {
+  const match = (tzStr || "+00:00").match(/^([+-])(\d{2}):(\d{2})$/);
+  if (!match) return 0;
+  const sign = match[1] === "+" ? 1 : -1;
+  return sign * (parseInt(match[2]) * 60 + parseInt(match[3])) * 60 * 1000;
+}
 
-  if (response.status === 404) return null;
+/**
+ * Fetch today's appointments from the GHL Appointments API.
+ * "Today" is determined relative to the APPOINTMENT_TZ environment variable.
+ * Returns array of appointment objects.
+ */
+async function fetchTodaysAppointments() {
+  const locationId = process.env.GHL_LOCATION_ID;
+  if (!locationId) throw new Error("GHL_LOCATION_ID environment variable is not set.");
+
+  const tzOffsetMs = parseTzOffsetMs(process.env.APPOINTMENT_TZ);
+
+  // Compute today's midnight (00:00:00) in local timezone, expressed as UTC epoch ms.
+  // e.g. for UTC-5: local midnight = UTC 05:00
+  const nowUtcMs = Date.now();
+  const localNow = new Date(nowUtcMs + tzOffsetMs);
+  localNow.setUTCHours(0, 0, 0, 0);                       // snap to local midnight
+  const startMs = localNow.getTime() - tzOffsetMs;         // convert back to UTC
+  const endMs   = startMs + 24 * 60 * 60 * 1000 - 1;      // 23:59:59.999 local
+
+  const url = new URL(`${GHL_API_BASE}/v1/appointments/`);
+  url.searchParams.set("locationId", locationId);
+  url.searchParams.set("startDate",  startMs.toString());
+  url.searchParams.set("endDate",    endMs.toString());
+
+  const response = await fetch(url.toString(), { headers: authHeaders() });
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`GHL contacts API returned ${response.status}: ${body}`);
+    throw new Error(`GHL appointments API returned ${response.status}: ${body}`);
   }
 
   const data = await response.json();
-  return data.contact ?? null;
+  return data.appointments ?? [];
 }
 
 /**
- * Parse the appointment Date from the contact's city + state fields.
- *
- *   contact.city  → "Feb 21, 2026"   (date written by Zapier)
- *   contact.state → "11:00AM"        (time written by Zapier)
- *
- * Timezone: set APPOINTMENT_TZ in your environment to a UTC offset string
- * such as "-05:00" (US Eastern) or "-06:00" (US Central) so Netlify (UTC)
- * interprets the time correctly. Defaults to UTC if not set.
- *
- * Returns a Date, or null if the fields are missing or unparseable.
+ * Returns true when nowMs is within the access window around the appointment.
  */
-function parseAppointmentDate(contact) {
-  const dateStr = (contact.city  || "").trim();  // "Feb 21, 2026"
-  const timeStr = (contact.state || "").trim();  // "11:00AM"
-
-  if (!dateStr || !timeStr) return null;
-
-  // Normalise "11:00AM" → "11:00 AM" for reliable Date() parsing
-  const timeNorm = timeStr.replace(/([AaPp][Mm])$/, " $1");
-
-  const tzOffset = (process.env.APPOINTMENT_TZ || "+00:00").trim();
-  const combined = `${dateStr} ${timeNorm} GMT${tzOffset}`;
-
-  const parsed = new Date(combined);
-  return isNaN(parsed.getTime()) ? null : parsed;
-}
-
-/**
- * Returns true when the appointment date is today (UTC date comparison).
- */
-function isToday(appointmentDate) {
-  const now = new Date();
+function isWithinWindow(appointmentStartMs, nowMs) {
   return (
-    appointmentDate.getUTCFullYear() === now.getUTCFullYear() &&
-    appointmentDate.getUTCMonth()    === now.getUTCMonth()    &&
-    appointmentDate.getUTCDate()     === now.getUTCDate()
+    nowMs >= appointmentStartMs - WINDOW_BEFORE_MS &&
+    nowMs <= appointmentStartMs + WINDOW_AFTER_MS
   );
 }
 
 /**
- * Returns true when now is within the access window around the appointment.
+ * Format an epoch-ms timestamp as a human-readable time in the local timezone.
  */
-function isWithinWindow(appointmentDate, nowMs) {
-  const apptMs = appointmentDate.getTime();
-  return nowMs >= apptMs - WINDOW_BEFORE_MS && nowMs <= apptMs + WINDOW_AFTER_MS;
+function formatLocalTime(epochMs, tzOffsetMs) {
+  const localDate = new Date(epochMs + tzOffsetMs);
+  const h = localDate.getUTCHours();
+  const m = localDate.getUTCMinutes().toString().padStart(2, "0");
+  const period = h >= 12 ? "PM" : "AM";
+  const display = h % 12 || 12;
+  return `${display}:${m} ${period}`;
 }
 
 // ----- Validation logic ----------------------------------------------------
 
-async function validateContactId(contactId) {
-  // Basic format guard: GHL contact IDs are alphanumeric, 10–30 chars
-  if (!/^[A-Za-z0-9]{10,30}$/.test(contactId)) {
-    return { valid: false, error: "Invalid contact ID format." };
+async function validateCode(code) {
+  // Format guard: exactly 4 alphanumeric characters (case-sensitive)
+  if (!/^[A-Za-z0-9]{4}$/.test(code)) {
+    return { valid: false, error: "Invalid code format. Expected 4 alphanumeric characters." };
   }
 
-  const contact = await fetchContact(contactId);
+  const appointments = await fetchTodaysAppointments();
 
-  if (!contact) {
-    return { valid: false, error: "Contact not found." };
+  // Find appointments whose contactId ends with the supplied 4-char code
+  const matches = appointments.filter(
+    (appt) => typeof appt.contactId === "string" && appt.contactId.endsWith(code)
+  );
+
+  if (matches.length === 0) {
+    return { valid: false, error: "No appointment found for today with this code." };
   }
 
-  const appointmentDate = parseAppointmentDate(contact);
-
-  if (!appointmentDate) {
+  if (matches.length > 1) {
     return {
       valid: false,
-      error: "No appointment date found on this contact.",
+      error: "Ambiguous code — multiple appointments match. Please contact us.",
     };
   }
 
-  if (!isToday(appointmentDate)) {
-    return {
-      valid: false,
-      error: `Appointment is on ${contact.city}, not today.`,
-    };
+  const appt = matches[0];
+
+  // startTime may be epoch ms (number) or an ISO string
+  const startMs =
+    typeof appt.startTime === "number"
+      ? appt.startTime
+      : new Date(appt.startTime).getTime();
+
+  if (isNaN(startMs)) {
+    return { valid: false, error: "Could not read appointment start time." };
   }
 
-  if (isWithinWindow(appointmentDate, Date.now())) {
+  const nowMs = Date.now();
+
+  if (isWithinWindow(startMs, nowMs)) {
     return { valid: true };
   }
+
+  const tzOffsetMs = parseTzOffsetMs(process.env.APPOINTMENT_TZ);
+  const apptTimeStr = formatLocalTime(startMs, tzOffsetMs);
 
   return {
     valid: false,
     error:
-      `Appointment is at ${contact.state} but you are outside the access ` +
+      `Appointment is at ${apptTimeStr} but you are outside the access ` +
       "window (2 hours before → 4 hours after appointment time).",
   };
 }
@@ -155,10 +172,10 @@ exports.handler = async (event) => {
     };
   }
 
-  let contactId;
+  let code;
   try {
     const body = JSON.parse(event.body || "{}");
-    contactId  = (body.contactId || "").trim();
+    code = (body.contactId || body.code || "").trim();
   } catch {
     return {
       statusCode: 400,
@@ -167,7 +184,7 @@ exports.handler = async (event) => {
     };
   }
 
-  if (!contactId) {
+  if (!code) {
     return {
       statusCode: 400,
       headers: CORS_HEADERS,
@@ -176,7 +193,7 @@ exports.handler = async (event) => {
   }
 
   try {
-    const result = await validateContactId(contactId);
+    const result = await validateCode(code);
     return {
       statusCode: 200,
       headers: CORS_HEADERS,
